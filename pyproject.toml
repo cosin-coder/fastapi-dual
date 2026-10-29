@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastapi-dual"
+version = "1.0.0"
+description = "A lightweight, high-performance Dual-Route gateway for IoT, inspired by Ktor & Go."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "ziming gao", email = "13342860122@163.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Framework :: FastAPI",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: System :: Hardware",
+]
+# 🌟 声明依赖，pip install 时会自动安装它们
+dependencies = [
+    "fastapi>=0.100.0",
+    "httpx>=0.24.0",
+    "uvicorn>=0.20.0"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/cosin-coder/fastapi-dual"
+"Bug Tracker" = "https://github.com/cosin-coder/fastapi-dual/issues"
