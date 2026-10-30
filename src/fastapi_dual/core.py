@@ -37,7 +37,17 @@ _mdns_cache: Dict[str, dict] = {}
 CACHE_TTL = 3600
 
 print("🌐 [mDNS] Initializing Zeroconf on all interfaces...")
-_zc = Zeroconf()
+
+def get_physical_ip():
+    """绕过所有虚拟网卡，只拿当前真实上网的 IP"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80)) 
+        return s.getsockname()[0] # 比如返回 192.168.3.85
+    finally:
+        s.close()
+
+_zc = Zeroconf(interfaces=[get_physical_ip()])
 
 class MDNSListener(ServiceListener):
     def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
