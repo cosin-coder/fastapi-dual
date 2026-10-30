@@ -2,7 +2,6 @@ import asyncio
 import json
 import time
 import httpx
-import socket
 import threading
 from typing import Callable, Awaitable, Optional, Dict
 from fastapi import FastAPI, Request, Response
@@ -14,34 +13,38 @@ from zeroconf import Zeroconf
 # ==========================================
 app = FastAPI(title="Dual Gateway", description="Built-in IoT Gateway with mDNS & Audit")
 _semaphore = asyncio.Semaphore(5)  # 限制最多同时 5 个请求去访问硬件
-_client = httpx.AsyncClient(timeout=3.0) # 全局 HTTP 客户端，复用连接池
 
-# 定义回调函数的类型签名
+# 🌟 注意：全局超时时间调大到了 10 秒，防止首次 mDNS 解析耗时过长导致 HTTP 请求本身超时
+_client = httpx.AsyncClient(timeout=10.0) 
+
 DualCallback = Callable[[dict], Awaitable[None]]
 
 # ==========================================
-# 🌟 mDNS 解析模块（带长效缓存）
+# 🌟 mDNS 解析模块（带并发去重与极速重试）
 # ==========================================
 _mdns_cache: Dict[str, dict] = {}
 _mdns_lock = threading.Lock()
+_parsing_locks: Dict[str, asyncio.Lock] = {}  # 🌟 并发去重锁
 CACHE_TTL = 3600  # 缓存 1 小时
 
 def _sync_mdns_resolve(hostname: str) -> Optional[str]:
-    """同步执行 mDNS 解析（将在后台线程中运行，避免阻塞主事件循环）"""
-    # 1. 尝试系统原生解析 (最快)
-    try:
-        return socket.gethostbyname(hostname)
-    except socket.gaierror:
-        pass
-    
-    # 2. 使用 Zeroconf 组播查询
+    """同步执行 mDNS 解析（纯 Zeroconf 实现，自带微重试）"""
+    # 直接使用 Zeroconf，跳过卡顿的系统原生 socket 解析
     zc = Zeroconf()
     try:
-        # 查找局域网内的 HTTP 服务注册
-        service_name = f"{hostname.replace('.local', '')}._http._tcp.local."
-        info = zc.get_service_info("_http._tcp.local.", service_name, timeout=1500)
-        if info and info.parsed_addresses():
-            return info.parsed_addresses()[0]
+        base_name = hostname.replace('.local', '')
+        service_name = f"{base_name}._http._tcp.local."
+        
+        # 🌟 微重试机制：尝试 3 次，每次等 800ms，比一次性等 1.5 秒更灵敏
+        for attempt in range(3):
+            try:
+                info = zc.get_service_info("_http._tcp.local.", service_name, timeout=800)
+                if info and info.parsed_addresses():
+                    return info.parsed_addresses()[0]
+            except Exception:
+                pass
+            time.sleep(0.2)  # 稍微等一下再重试
+            
     except Exception as e:
         print(f"⚠️ [mDNS] Query failed for {hostname}: {e}")
     finally:
@@ -56,31 +59,40 @@ async def _resolve_client_url(client_url: str) -> tuple[str, bool, str]:
     hostname = client_url.split("//")[-1].split("/")[0].split(":")[0]
     current_time = time.time()
 
-    # 检查缓存
+    # 1. 检查缓存
     with _mdns_lock:
         cached = _mdns_cache.get(hostname)
         if cached and (current_time - cached["time"] < CACHE_TTL):
             return client_url.replace(hostname, cached["ip"]), True, cached["ip"]
 
-    # 缓存未命中，执行解析
-    resolved_ip = await asyncio.to_thread(_sync_mdns_resolve, hostname)
-    
-    if resolved_ip:
+    # 2. 🌟 并发去重：防止前端一瞬间发 10 个请求，导致发 10 次 UDP 广播
+    if hostname not in _parsing_locks:
+        _parsing_locks[hostname] = asyncio.Lock()
+
+    async with _parsing_locks[hostname]:
+        # 双重检查（Double-Checked Locking）：可能在等锁的时候，别人已经解析好了
         with _mdns_lock:
-            _mdns_cache[hostname] = {"ip": resolved_ip, "time": current_time}
-        print(f"✅ [mDNS] Resolved & Cached: {hostname} -> {resolved_ip}")
-        return client_url.replace(hostname, resolved_ip), True, resolved_ip
-    else:
-        print(f"❌ [mDNS] Resolution Failed: {hostname}")
-        # 🌟 关键：解析失败立刻抛出异常，触发 Fail-fast
-        raise ConnectionError(f"mDNS resolution failed for {hostname}. Ensure the device is online.")
+            cached = _mdns_cache.get(hostname)
+            if cached and (time.time() - cached["time"] < CACHE_TTL):
+                return client_url.replace(hostname, cached["ip"]), True, cached["ip"]
+
+        # 3. 真正执行解析（放入线程池，绝不阻塞主事件循环）
+        resolved_ip = await asyncio.to_thread(_sync_mdns_resolve, hostname)
+        
+        if resolved_ip:
+            with _mdns_lock:
+                _mdns_cache[hostname] = {"ip": resolved_ip, "time": time.time()}
+            print(f"✅ [mDNS] Resolved & Cached: {hostname} -> {resolved_ip}")
+            return client_url.replace(hostname, resolved_ip), True, resolved_ip
+        else:
+            print(f"❌ [mDNS] Resolution Failed after retries: {hostname}")
+            raise ConnectionError(f"mDNS resolution failed for {hostname}. Ensure the device is online.")
 
 
 # ==========================================
-# 🌟 核心路由装饰器
+# 🌟 核心路由装饰器 (代码保持不变)
 # ==========================================
 def route(path: str, method: str = "GET", client_url: str = "", cb: Optional[DualCallback] = None):
-    """声明式双面路由装饰器"""
     def decorator(func):
         endpoint = _create_endpoint(func, path, method, client_url, cb)
         app.add_api_route(path, endpoint, methods=[method])
@@ -92,7 +104,6 @@ def _create_endpoint(func, path, method, client_url, cb):
     async def endpoint(request: Request):
         start_time = time.perf_counter()
 
-        # 用于全链路审计的上下文
         ctx = {
             "path": path,
             "method": method,
@@ -109,7 +120,6 @@ def _create_endpoint(func, path, method, client_url, cb):
             "elapsed_ms": 0
         }
 
-        # 1. 并发背压控制
         if _semaphore.locked():
             ctx["error"] = "ESP32_BUSY"
             ctx["elapsed_ms"] = (time.perf_counter() - start_time) * 1000
@@ -117,7 +127,6 @@ def _create_endpoint(func, path, method, client_url, cb):
             return JSONResponse(status_code=429, content={"error": "Too many requests"})
 
         async with _semaphore:
-            # 2. mDNS 动态解析 (Fail-fast)
             try:
                 resolved_url, is_mdns, ip = await _resolve_client_url(client_url)
                 ctx["resolved_client_url"] = resolved_url
@@ -127,15 +136,12 @@ def _create_endpoint(func, path, method, client_url, cb):
                 ctx["error"] = str(e)
                 ctx["elapsed_ms"] = (time.perf_counter() - start_time) * 1000
                 if cb: await _safe_call_cb(cb, ctx)
-                # 直接返回 502，绝不等 HTTP 超时
                 return JSONResponse(status_code=502, content={"error": str(e)})
 
-            # 3. 组装目标 URL 并透传 Query 参数
             full_url = f"{resolved_url.rstrip('/')}{path}"
             if request.query_params:
                 full_url += f"?{request.url.query}"
 
-            # 4. 透传 Body 和 Headers (针对 POST/PUT)
             req_body = None
             req_headers = {}
             if method.upper() in ["POST", "PUT", "PATCH"]:
@@ -143,7 +149,6 @@ def _create_endpoint(func, path, method, client_url, cb):
                 if "content-type" in request.headers:
                     req_headers["Content-Type"] = request.headers["content-type"]
 
-            # 5. 请求硬件
             try:
                 resp = await _client.request(
                     method=method.upper(),
@@ -157,7 +162,6 @@ def _create_endpoint(func, path, method, client_url, cb):
                 ctx["error"] = str(e)
                 raw_text = f'{{"error": "Failed to connect to hardware: {str(e)}"}}'
 
-            # 6. 智能解析硬件返回 (JSON 或 纯文本/HTML)
             esp_data = raw_text
             try:
                 esp_data = json.loads(raw_text)
@@ -165,7 +169,6 @@ def _create_endpoint(func, path, method, client_url, cb):
                 pass
             ctx["esp_data"] = esp_data
 
-            # 7. 执行业务逻辑
             try:
                 result = await func(esp_data)
                 ctx["result"] = result
@@ -176,12 +179,10 @@ def _create_endpoint(func, path, method, client_url, cb):
                     await _safe_call_cb(cb, ctx)
                 return JSONResponse(status_code=500, content={"error": ctx["error"]})
 
-            # 8. 计算耗时并触发全链路回调
             ctx["elapsed_ms"] = (time.perf_counter() - start_time) * 1000
             if cb:
                 await _safe_call_cb(cb, ctx)
 
-            # 9. 智能响应引擎
             if isinstance(result, str):
                 if result.strip().startswith("<"):
                     return Response(content=result, media_type="text/html")
@@ -193,7 +194,6 @@ def _create_endpoint(func, path, method, client_url, cb):
 
 
 async def _safe_call_cb(cb, ctx):
-    """安全执行回调，防止回调异常导致网关崩溃"""
     try:
         await cb(ctx)
     except Exception as e:
