@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastapi-dual"
-version = "1.0.0"
+version = "1.3.1"
 description = "A lightweight, high-performance Dual-Route gateway for IoT, inspired by Ktor & Go."
 readme = "README.md"
 requires-python = ">=3.9"
