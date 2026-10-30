@@ -7,46 +7,26 @@ import atexit
 from typing import Callable, Awaitable, Optional, Dict
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from zeroconf import Zeroconf, ServiceBrowser, ServiceListener, InterfaceChoice
+from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
 
 # ==========================================
 # 🌟 全局实例与背压配置
 # ==========================================
 app = FastAPI(title="Dual Gateway", description="Built-in IoT Gateway with mDNS & Audit")
 _semaphore = asyncio.Semaphore(5)
-# 注意：超时时间设为 10 秒，兜底首次查询耗时
 _client = httpx.AsyncClient(timeout=10.0) 
 
 DualCallback = Callable[[dict], Awaitable[None]]
 
 # ==========================================
-# 🌟 终极 mDNS 模块：强制指定物理网卡
+# 🌟 终极 mDNS 模块：全量网卡监听 + 启动预热
 # ==========================================
 _mdns_cache: Dict[str, dict] = {}
 CACHE_TTL = 3600
 
-# 获取本机真实内网 IP，用于锁定网卡
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # 不会真正发送数据，但能获取当前路由使用的 IP
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = '127.0.0.1'
-    finally:
-        s.close()
-    return ip
-
-_LOCAL_IP = get_local_ip()
-print(f"🌐 [mDNS] Binding to network interface: {_LOCAL_IP}")
-
-# 🌟 核心修复：强制 Zeroconf 只使用主网卡，避免被 VMware/虚拟网卡吞掉 UDP 包
-try:
-    _zc = Zeroconf(interfaces=[_LOCAL_IP])
-except Exception as e:
-    print(f"⚠️ Failed to bind specific interface, falling back to default: {e}")
-    _zc = Zeroconf()
+# 🌟 放弃强制绑定单网卡，让系统自动处理所有网卡（包括虚拟网卡）
+print("🌐 [mDNS] Initializing Zeroconf on all interfaces...")
+_zc = Zeroconf()
 
 class MDNSListener(ServiceListener):
     def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
@@ -66,20 +46,23 @@ class MDNSListener(ServiceListener):
     def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         self.add_service(zc, type_, name)
 
+# 启动后台被动监听
 _mdns_browser = ServiceBrowser(_zc, "_http._tcp.local.", MDNSListener())
 atexit.register(lambda: _zc.close())
 
 def _sync_mdns_resolve(hostname: str) -> Optional[str]:
     service_name = f"{hostname.replace('.local', '')}._http._tcp.local."
-    # 尝试 3 次，每次等 2 秒（总耗时 6 秒），给路由器充足的时间转发组播包
-    for _ in range(3):
+    print(f"🔎 [mDNS] Active querying for {service_name}...")
+    
+    # 🌟 暴力重试：尝试 3 次，每次等 2 秒
+    for i in range(3):
         try:
             info = _zc.get_service_info("_http._tcp.local.", service_name, timeout=2000)
             if info and info.parsed_addresses():
                 return info.parsed_addresses()[0]
-        except Exception:
-            pass
-        time.sleep(0.2)
+        except Exception as e:
+            print(f"⚠️ [mDNS] Query attempt {i+1} failed: {e}")
+        time.sleep(0.5)
     return None
 
 async def _resolve_client_url(client_url: str) -> tuple[str, bool, str]:
@@ -89,12 +72,12 @@ async def _resolve_client_url(client_url: str) -> tuple[str, bool, str]:
     hostname = client_url.split("//")[-1].split("/")[0].split(":")[0]
     current_time = time.time()
 
+    # 检查缓存
     cached = _mdns_cache.get(hostname)
     if cached and (current_time - cached["time"] < CACHE_TTL):
         return client_url.replace(hostname, cached["ip"]), True, cached["ip"]
 
-    # 缓存没命中，强行发查询
-    print(f"🔎 [mDNS] First-time lookup for {hostname}, please wait...")
+    # 缓存没命中，主动发查询
     resolved_ip = await asyncio.to_thread(_sync_mdns_resolve, hostname)
     
     if resolved_ip:
@@ -102,12 +85,39 @@ async def _resolve_client_url(client_url: str) -> tuple[str, bool, str]:
         print(f"✅ [mDNS Query] Resolved: {hostname} -> {resolved_ip}")
         return client_url.replace(hostname, resolved_ip), True, resolved_ip
     else:
-        print(f"❌ [mDNS] Lookup failed for {hostname}. Is ESP32 online?")
-        raise ConnectionError(f"mDNS resolution failed for {hostname}. Check your WiFi router isolation settings or firewall.")
-
+        print(f"❌ [mDNS] Lookup failed for {hostname}.")
+        raise ConnectionError(
+            f"mDNS resolution failed for {hostname}. 请检查："
+            f"1. ESP32 是否开机且连上同一 WiFi？"
+            f"2. Windows 防火墙是否拦截了 Python 的 UDP 入站？"
+            f"3. 路由器是否开启了 AP 隔离（访客模式）？"
+        )
 
 # ==========================================
-# 🌟 核心路由装饰器与业务逻辑
+# 🌟 启动预热机制（极其重要！解决第一次卡顿）
+# ==========================================
+@app.on_event("startup")
+async def startup_warmup():
+    """
+    当 FastAPI 启动时，后台默默去解析已知的 .local 设备。
+    这样用户第一次发请求时，缓存里已经有 IP 了，直接秒过！
+    """
+    # 🌟 把你业务里用到的所有 .local 域名写在这里
+    known_devices = ["http://tb-2300.local"] 
+    
+    async def warmup_task():
+        await asyncio.sleep(1) # 等待底层网络栈就绪
+        for url in known_devices:
+            try:
+                print(f"🔥 [Warmup] Pre-resolving {url}...")
+                await _resolve_client_url(url)
+            except Exception as e:
+                print(f"⚠️ [Warmup] Failed to pre-resolve {url}: {e}")
+                
+    asyncio.create_task(warmup_task())
+
+# ==========================================
+# 🌟 核心路由装饰器与业务逻辑 (保持不变)
 # ==========================================
 def route(path: str, method: str = "GET", client_url: str = "", cb: Optional[DualCallback] = None):
     def decorator(func):
