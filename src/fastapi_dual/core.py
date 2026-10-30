@@ -4,10 +4,12 @@ import time
 import httpx
 import socket
 import atexit
+import inspect
 from typing import Callable, Awaitable, Optional, Dict
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
+from pydantic import BaseModel
 
 # ==========================================
 # 🌟 全局实例与背压配置
@@ -19,12 +21,11 @@ _client = httpx.AsyncClient(timeout=10.0)
 DualCallback = Callable[[dict], Awaitable[None]]
 
 # ==========================================
-# 🌟 终极 mDNS 模块：全量网卡监听 + 启动预热
+# 🌟 mDNS 模块：全量网卡监听 + 启动预热
 # ==========================================
 _mdns_cache: Dict[str, dict] = {}
 CACHE_TTL = 3600
 
-# 🌟 放弃强制绑定单网卡，让系统自动处理所有网卡（包括虚拟网卡）
 print("🌐 [mDNS] Initializing Zeroconf on all interfaces...")
 _zc = Zeroconf()
 
@@ -46,7 +47,6 @@ class MDNSListener(ServiceListener):
     def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
         self.add_service(zc, type_, name)
 
-# 启动后台被动监听
 _mdns_browser = ServiceBrowser(_zc, "_http._tcp.local.", MDNSListener())
 atexit.register(lambda: _zc.close())
 
@@ -54,7 +54,6 @@ def _sync_mdns_resolve(hostname: str) -> Optional[str]:
     service_name = f"{hostname.replace('.local', '')}._http._tcp.local."
     print(f"🔎 [mDNS] Active querying for {service_name}...")
     
-    # 🌟 暴力重试：尝试 3 次，每次等 2 秒
     for i in range(3):
         try:
             info = _zc.get_service_info("_http._tcp.local.", service_name, timeout=2000)
@@ -72,12 +71,10 @@ async def _resolve_client_url(client_url: str) -> tuple[str, bool, str]:
     hostname = client_url.split("//")[-1].split("/")[0].split(":")[0]
     current_time = time.time()
 
-    # 检查缓存
     cached = _mdns_cache.get(hostname)
     if cached and (current_time - cached["time"] < CACHE_TTL):
         return client_url.replace(hostname, cached["ip"]), True, cached["ip"]
 
-    # 缓存没命中，主动发查询
     resolved_ip = await asyncio.to_thread(_sync_mdns_resolve, hostname)
     
     if resolved_ip:
@@ -94,19 +91,15 @@ async def _resolve_client_url(client_url: str) -> tuple[str, bool, str]:
         )
 
 # ==========================================
-# 🌟 启动预热机制（极其重要！解决第一次卡顿）
+# 🌟 启动预热机制
 # ==========================================
 @app.on_event("startup")
 async def startup_warmup():
-    """
-    当 FastAPI 启动时，后台默默去解析已知的 .local 设备。
-    这样用户第一次发请求时，缓存里已经有 IP 了，直接秒过！
-    """
-    # 🌟 把你业务里用到的所有 .local 域名写在这里
+    # 注意：确保这里写的名字和你 main.py 里用的完全一致（注意有没有横杠）
     known_devices = ["http://tb-2300.local"] 
     
     async def warmup_task():
-        await asyncio.sleep(1) # 等待底层网络栈就绪
+        await asyncio.sleep(1)
         for url in known_devices:
             try:
                 print(f"🔥 [Warmup] Pre-resolving {url}...")
@@ -117,7 +110,7 @@ async def startup_warmup():
     asyncio.create_task(warmup_task())
 
 # ==========================================
-# 🌟 核心路由装饰器与业务逻辑 (保持不变)
+# 🌟 核心路由装饰器
 # ==========================================
 def route(path: str, method: str = "GET", client_url: str = "", cb: Optional[DualCallback] = None):
     def decorator(func):
@@ -127,6 +120,19 @@ def route(path: str, method: str = "GET", client_url: str = "", cb: Optional[Dua
     return decorator
 
 def _create_endpoint(func, path, method, client_url, cb):
+    # ==========================================
+    # 🌟 魔法核心：通过反射获取函数的类型注解
+    # ==========================================
+    sig = inspect.signature(func)
+    params = list(sig.parameters.values())
+    target_model = None
+    
+    if params:
+        annotation = params[0].annotation
+        # 检查第一个参数是否标注了 Pydantic 模型
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            target_model = annotation
+
     async def endpoint(request: Request):
         start_time = time.perf_counter()
 
@@ -174,14 +180,42 @@ def _create_endpoint(func, path, method, client_url, cb):
                 ctx["error"] = str(e)
                 raw_text = f'{{"error": "Failed to connect to hardware: {str(e)}"}}'
 
-            esp_data = raw_text
+            # ==========================================
+            # 🌟 智能解析硬件返回
+            # ==========================================
+            parsed_dict = None
             try:
-                esp_data = json.loads(raw_text)
+                parsed_dict = json.loads(raw_text)
             except json.JSONDecodeError:
                 pass
+
+            if target_model is not None:
+                # 如果底层返回了 error（比如硬件离线）
+                if isinstance(parsed_dict, dict) and "error" in parsed_dict:
+                    ctx["error"] = parsed_dict["error"]
+                    ctx["elapsed_ms"] = (time.perf_counter() - start_time) * 1000
+                    if cb: await _safe_call_cb(cb, ctx)
+                    return JSONResponse(status_code=502, content={"error": ctx["error"]})
+                
+                # 自动反序列化为 Pydantic 对象
+                try:
+                    if isinstance(parsed_dict, dict):
+                        esp_data = target_model(**parsed_dict)
+                    else:
+                        esp_data = target_model()
+                except Exception as e:
+                    ctx["error"] = f"Pydantic validation failed: {e}"
+                    ctx["elapsed_ms"] = (time.perf_counter() - start_time) * 1000
+                    if cb: await _safe_call_cb(cb, ctx)
+                    return JSONResponse(status_code=500, content={"error": ctx["error"]})
+            else:
+                # 否则保持原来的 dict / str 格式
+                esp_data = parsed_dict if parsed_dict is not None else raw_text
+                
             ctx["esp_data"] = esp_data
 
             try:
+                # 将解析好的对象直接传给业务函数
                 result = await func(esp_data)
                 ctx["result"] = result
             except Exception as e:
