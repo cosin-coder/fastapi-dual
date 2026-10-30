@@ -5,7 +5,7 @@ import httpx
 import socket
 import atexit
 import inspect
-from typing import Callable, Awaitable, Optional, Dict
+from typing import Callable, Awaitable, Optional, Dict, List
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
@@ -19,6 +19,16 @@ _semaphore = asyncio.Semaphore(5)
 _client = httpx.AsyncClient(timeout=10.0) 
 
 DualCallback = Callable[[dict], Awaitable[None]]
+
+# ==========================================
+# 🌟 动态预热注册表
+# ==========================================
+_warmup_devices: List[str] = []
+
+def register_warmup(url: str):
+    """供外部调用，注册需要启动预热的硬件地址"""
+    if url not in _warmup_devices:
+        _warmup_devices.append(url)
 
 # ==========================================
 # 🌟 mDNS 模块：全量网卡监听 + 启动预热
@@ -95,12 +105,9 @@ async def _resolve_client_url(client_url: str) -> tuple[str, bool, str]:
 # ==========================================
 @app.on_event("startup")
 async def startup_warmup():
-    # 注意：确保这里写的名字和你 main.py 里用的完全一致（注意有没有横杠）
-    known_devices = ["http://tb-2300.local"] 
-    
     async def warmup_task():
         await asyncio.sleep(1)
-        for url in known_devices:
+        for url in _warmup_devices:
             try:
                 print(f"🔥 [Warmup] Pre-resolving {url}...")
                 await _resolve_client_url(url)
@@ -110,7 +117,20 @@ async def startup_warmup():
     asyncio.create_task(warmup_task())
 
 # ==========================================
-# 🌟 核心路由装饰器
+# 🌟 核心装饰器 1：普通本地路由（不走硬件）
+# ==========================================
+def local_route(path: str, method: str = "GET"):
+    """
+    普通本地路由装饰器。
+    不请求外部硬件，完全由 FastAPI 和本地 Python 代码处理。
+    """
+    def decorator(func):
+        app.add_api_route(path, func, methods=[method])
+        return func
+    return decorator
+
+# ==========================================
+# 🌟 核心装饰器 2：双面硬件路由（走底层网络与 mDNS）
 # ==========================================
 def route(path: str, method: str = "GET", client_url: str = "", cb: Optional[DualCallback] = None):
     def decorator(func):
@@ -120,9 +140,7 @@ def route(path: str, method: str = "GET", client_url: str = "", cb: Optional[Dua
     return decorator
 
 def _create_endpoint(func, path, method, client_url, cb):
-    # ==========================================
-    # 🌟 魔法核心：通过反射获取函数的类型注解
-    # ==========================================
+    # 通过反射获取函数的类型注解
     sig = inspect.signature(func)
     params = list(sig.parameters.values())
     target_model = None
@@ -180,9 +198,7 @@ def _create_endpoint(func, path, method, client_url, cb):
                 ctx["error"] = str(e)
                 raw_text = f'{{"error": "Failed to connect to hardware: {str(e)}"}}'
 
-            # ==========================================
-            # 🌟 智能解析硬件返回
-            # ==========================================
+            # 智能解析硬件返回
             parsed_dict = None
             try:
                 parsed_dict = json.loads(raw_text)
